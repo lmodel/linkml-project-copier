@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Profile every shell step that `just setup` executes.
+
+`just setup` sequences:
+  1. _check-config        (trivial - skipped)
+  2. _git-init            (trivial - skipped)
+  3. install              uv sync --group dev
+  4. _git-add             git add .
+  5. gen-project
+     5a. gen-project CLI  uv run gen-project --config-file config.yaml …
+     5b. gen-pydantic     uv run gen-pydantic … > …
+     5c. gen-java         uv run gen-java … --output-directory project/java/
+     5d. gen-typescript   uv run gen-typescript … > project/typescript/{{ project_slug }}.ts
+     5e. gen-owl          uv run gen-owl … > project/owl/{{ project_slug }}.owl.ttl
+  6. gen-doc
+     6a. _gen-yaml        uv run gen-yaml … > docs/schema/{{ project_slug }}.yaml
+     6b. gen-doc CLI      uv run gen-doc … -d docs/elements …
+
+Each step is run in a subprocess with a configurable hard timeout.  On
+timeout the process is killed and any faulthandler traceback that was written
+to a stack-log file is reported.
+
+Usage
+-----
+    uv run python scripts/debug_setup.py --schema src/{{ project_slug }}/schema/{{ project_slug }}.yaml
+    uv run python scripts/debug_setup.py --schema src/{{ project_slug }}/schema/{{ project_slug }}.yaml \\
+      --timeout 1800 --skip install,git-add
+    uv run python scripts/debug_setup.py --schema src/{{ project_slug }}/schema/{{ project_slug }}.yaml \\
+      --only gen-pydantic,gen-java,gen-typescript,gen-yaml,gen-doc
+
+Notes
+-----
+- The existing script `scripts/debug_each_generator.py` already times the
+  generators that `gen-project` runs internally (graphql, python, sqltable …).
+  This script focuses on the **additional** commands that `just setup` runs
+  **after** those generators have finished, which are the most likely hang
+  points for this schema.
+- Use ``--skip gen-project`` to skip the ~20-minute gen-project step when you
+  already know it completes; the interesting unknowns are gen-pydantic,
+  gen-java, gen-typescript, gen-yaml, and gen-doc.
+"""
+
+import argparse
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_env(schema_path: Path) -> dict:
+    """Return env vars needed to replicate what just/config.public.mk inject."""
+    schema_name = schema_path.stem
+    source_schema_dir = str(schema_path.parent)
+    env = os.environ.copy()
+    env.setdefault("LINKML_SCHEMA_NAME", schema_name)
+    env.setdefault("LINKML_SCHEMA_SOURCE_DIR", source_schema_dir)
+    env.setdefault("LINKML_GENERATORS_CONFIG_YAML", "config.yaml")
+    env.setdefault("LINKML_GENERATORS_OWL_ARGS", "")
+    env.setdefault("LINKML_GENERATORS_PYDANTIC_ARGS", "")
+    env.setdefault("LINKML_GENERATORS_DOC_ARGS", "")
+    env.setdefault("LINKML_GENERATORS_JAVA_ARGS", "")
+    env.setdefault("LINKML_GENERATORS_TYPESCRIPT_ARGS", "")
+    return env
+
+
+def _build_step_list(schema_path: Path, outdir: Path) -> list[tuple[str, list[str]]]:
+    """Build the ordered list of (step_name, argv) pairs."""
+    schema = str(schema_path)
+    dest = str(outdir)                               # temporary project dir
+    pymodel = str(outdir / "datamodel")
+    java_out = str(outdir / "java")
+    ts_out = str(outdir / "typescript")
+    owl_out = str(outdir / "owl")
+    schema_dir = str(outdir / "schema")
+    doc_out = str(outdir / "doc_elements")
+
+    for d in [pymodel, java_out, ts_out, owl_out, schema_dir, doc_out]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+
+    steps: list[tuple[str, list[str]]] = [
+        # --- Step 3: install ---
+        ("install",
+         ["uv", "sync", "--group", "dev"]),
+
+        # --- Step 4: git-add (safe read-only index refresh) ---
+        ("git-add",
+         ["git", "add", "--dry-run", "."]),
+
+        # --- Step 5a: gen-project (runs ALL internal generators via config) ---
+        ("gen-project",
+         ["uv", "run", "gen-project",
+          "--config-file", "config.yaml",
+          "-d", dest,
+          schema]),
+
+        # --- Step 5b: gen-pydantic ---
+        ("gen-pydantic",
+         ["uv", "run", "gen-pydantic",
+          schema]),
+
+        # --- Step 5c: gen-java ---
+        ("gen-java",
+         ["uv", "run", "gen-java",
+          "--output-directory", java_out,
+          schema]),
+
+        # --- Step 5d: gen-typescript ---
+        ("gen-typescript",
+         ["uv", "run", "gen-typescript",
+          schema]),
+
+        # --- Step 5e: gen-owl (with config args from config.public.mk) ---
+        ("gen-owl",
+         ["uv", "run", "gen-owl",
+          schema]),
+
+        # --- Step 6a: gen-yaml ---
+        ("gen-yaml",
+         ["uv", "run", "gen-yaml",
+          schema]),
+
+        # --- Step 6b: gen-doc (most likely hang point for large schemas) ---
+        ("gen-doc",
+         ["uv", "run", "gen-doc",
+          "-d", doc_out,
+          schema]),
+    ]
+    return steps
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+def _tee_stream(src_pipe, file_sink, terminal_sink) -> None:
+    """Copy bytes from src_pipe to both file_sink and terminal_sink until EOF."""
+    try:
+        for chunk in iter(lambda: src_pipe.read(4096), b""):
+            file_sink.write(chunk)
+            file_sink.flush()
+            try:
+                terminal_sink.write(chunk)
+                terminal_sink.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def run_step(
+    step_name: str,
+    argv: list[str],
+    timeout_s: int,
+    stack_dir: Path,
+    verbose: bool,
+    env: dict,
+) -> tuple[float, str, str]:
+    """Run one step in a subprocess; enforce a hard timeout.
+
+    Returns (elapsed_seconds, status, notes).
+    status is one of: 'ok', 'timeout', 'error'.
+    """
+    stack_path = stack_dir / f"{step_name}-stacks.log"
+    stdout_path = stack_dir / f"{step_name}-stdout.log"
+    stderr_path = stack_dir / f"{step_name}-stderr.log"
+
+    if verbose:
+        logging.info(f"[debug-setup] Running: {' '.join(argv)}")
+
+    start = time.monotonic()
+    fout = open(stdout_path, "wb")
+    ferr = open(stderr_path, "wb")
+    try:
+        print(f"\n--- [{step_name}] {' '.join(argv)} ---", flush=True)
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            # Use a new process group so we can kill the whole tree on timeout.
+            start_new_session=True,
+        )
+
+        # Tee stdout and stderr to both the log file and the live terminal.
+        t_out = threading.Thread(
+            target=_tee_stream,
+            args=(proc.stdout, fout, sys.stdout.buffer),
+            daemon=True,
+        )
+        t_err = threading.Thread(
+            target=_tee_stream,
+            args=(proc.stderr, ferr, sys.stderr.buffer),
+            daemon=True,
+        )
+        t_out.start()
+        t_err.start()
+
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+            fout.close()
+            ferr.close()
+            elapsed = time.monotonic() - start
+
+            notes = f"stdout→{stdout_path}  stderr→{stderr_path}"
+            with open(stack_path, "w") as sf:
+                sf.write(f"=== Timeout after {elapsed:.1f}s for: {' '.join(argv)} ===\n\n")
+                try:
+                    sf.write("--- stderr ---\n")
+                    sf.write(stderr_path.read_text(errors="replace")[-8000:])
+                except Exception:
+                    pass
+            return elapsed, "timeout", str(stack_path)
+
+        t_out.join(timeout=30)
+        t_err.join(timeout=30)
+        fout.close()
+        ferr.close()
+        elapsed = time.monotonic() - start
+        rc = proc.returncode
+        if rc == 0:
+            if verbose:
+                logging.info(f"[debug-setup] {step_name} OK in {elapsed:.1f}s")
+            return elapsed, "ok", ""
+        else:
+            # Non-zero exit: log stderr excerpt
+            try:
+                err_tail = stderr_path.read_text(errors="replace")[-2000:]
+            except Exception:
+                err_tail = "(could not read stderr)"
+            notes = f"rc={rc}  stderr→{stderr_path}"
+            with open(stack_path, "w") as sf:
+                sf.write(f"=== rc={rc} for: {' '.join(argv)} ===\n\n{err_tail}\n")
+            return elapsed, "error", notes
+
+    except FileNotFoundError as exc:
+        elapsed = time.monotonic() - start
+        fout.close()
+        ferr.close()
+        return elapsed, "error", f"command not found: {exc}"
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        fout.close()
+        ferr.close()
+        return elapsed, "error", str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Profile every shell command that `just setup` executes, "
+            "with per-step timeouts and stack capture."
+        )
+    )
+    parser.add_argument(
+        "--schema", required=True, type=Path,
+        help="Absolute path to schema YAML file (e.g. src/{{ project_slug }}/schema/{{ project_slug }}.yaml)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=1800,
+        help="Per-step hard timeout in seconds (default: 1800).  "
+             "Use 0 for no timeout (run forever).",
+    )
+    parser.add_argument(
+        "--skip", default="",
+        help="Comma-separated step names to skip entirely.",
+    )
+    parser.add_argument(
+        "--only", default="",
+        help="Comma-separated step names to run exclusively (overrides --skip).  "
+             "Useful to jump straight to: gen-pydantic,gen-java,gen-typescript,gen-yaml,gen-doc",
+    )
+    parser.add_argument(
+        "--outdir", type=Path,
+        default=None,
+        help="Scratch directory for generated output (default: /tmp/<schema_name>-debug-setup).",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    schema_path = args.schema.resolve()
+    if not schema_path.exists():
+        logging.error(f"Schema not found: {schema_path}")
+        sys.exit(1)
+
+    timeout_s = args.timeout if args.timeout > 0 else 2**31
+
+    schema_name = schema_path.stem
+    outdir = args.outdir or Path(f"/tmp/{schema_name}-debug-setup")
+    outdir.mkdir(parents=True, exist_ok=True)
+    stack_dir = outdir / "logs"
+    stack_dir.mkdir(parents=True, exist_ok=True)
+
+    skip_set = {s.strip() for s in args.skip.split(",") if s.strip()}
+    only_set = {s.strip() for s in args.only.split(",") if s.strip()}
+
+    env = _resolve_env(schema_path)
+    steps = _build_step_list(schema_path, outdir)
+
+    # ---- Print header ----
+    print(
+        f"\nProfiling `just setup` steps"
+        f"\n  Schema  : {schema_path}"
+        f"\n  Outdir  : {outdir}"
+        f"\n  Timeout : {timeout_s}s per step"
+        f"\n  Skip    : {skip_set or '(none)'}"
+        f"\n  Only    : {only_set or '(all)'}"
+        f"\n"
+    )
+    print(f"\n{'Step':<20} {'Status':<10} {'Elapsed':>10}  Notes")
+    print("-" * 80)
+
+    results: list[tuple[str, str, float, str]] = []
+    for step_name, argv in steps:
+        if only_set and step_name not in only_set:
+            print(f"{step_name:<20} {'SKIP':<10} {'':>10}  (not in --only)")
+            continue
+        if step_name in skip_set:
+            print(f"{step_name:<20} {'SKIP':<10} {'':>10}  (in --skip)")
+            continue
+
+        print(f"{step_name:<20} {'running…':<10} {'':>10}", end="", flush=True)
+        elapsed, status, notes = run_step(
+            step_name=step_name,
+            argv=argv,
+            timeout_s=timeout_s,
+            stack_dir=stack_dir,
+            verbose=args.verbose,
+            env=env,
+        )
+        # Overwrite the running… line.
+        flag = "OK" if status == "ok" else ("TIMEOUT" if status == "timeout" else "ERROR")
+        print(f"\r{step_name:<20} {flag:<10} {elapsed:>9.1f}s  {notes}")
+        results.append((step_name, status, elapsed, notes))
+
+        if status == "timeout":
+            print(
+                f"\n⚠  '{step_name}' timed out after {timeout_s}s — stopping here."
+                f"\n   This is most likely the hanging step in `just setup`."
+                f"\n   Inspect logs in: {stack_dir}"
+            )
+            _print_summary(results)
+            sys.exit(1)
+
+    _print_summary(results)
+    errors = [r for r in results if r[1] == "error"]
+    if errors:
+        sys.exit(2)
+
+
+def _print_summary(results: list[tuple[str, str, float, str]]) -> None:
+    print("\n=== Summary ===")
+    for step_name, status, elapsed, notes in results:
+        flag = "✓" if status == "ok" else ("✗ TIMEOUT" if status == "timeout" else "✗ ERROR")
+        print(f"  {flag:<12} {step_name:<20} {elapsed:>9.1f}s")
+
+    total = sum(r[2] for r in results)
+    print(f"  {'':12} {'TOTAL':<20} {total:>9.1f}s")
+
+    timed_out = [r for r in results if r[1] == "timeout"]
+    errors = [r for r in results if r[1] == "error"]
+    if not timed_out and not errors:
+        print("\nAll steps completed within timeout.")
+    if timed_out:
+        print(f"\nHanging step(s): {', '.join(r[0] for r in timed_out)}")
+    if errors:
+        print(f"\nFailed step(s):  {', '.join(r[0] for r in errors)}")
+
+
+if __name__ == "__main__":
+    main()

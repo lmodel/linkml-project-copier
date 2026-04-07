@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Run each gen-project generator individually, time it, capture stack traces on timeout.
+
+Generator execution order mirrors GEN_MAP in linkml/generators/projectgen.py:
+  graphql → jsonldcontext → jsonld → jsonschema → owl → prefixmap → proto →
+  python → shex → shacl → sqltable → excel
+
+Usage
+-----
+    uv run python scripts/debug_each_generator.py --schema src/{{ project_slug }}/schema/{{ project_slug }}.yaml
+    uv run python scripts/debug_each_generator.py --schema src/{{ project_slug }}/schema/{{ project_slug }}.yaml \
+      --skip graphql,jsonldcontext,jsonld,jsonschema,owl,prefixmap,proto \
+      --timeout 120
+"""
+
+import argparse
+import faulthandler
+import logging
+import multiprocessing as mp
+import signal
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Each entry: (gen_name, generatorClass, output_suffix, default_args)
+# Mirrors GEN_MAP from linkml/generators/projectgen.py
+# ---------------------------------------------------------------------------
+def _build_gen_map():
+    from linkml.generators.excelgen import ExcelGenerator
+    from linkml.generators.graphqlgen import GraphqlGenerator
+    from linkml.generators.jsonldcontextgen import ContextGenerator
+    from linkml.generators.jsonldgen import JSONLDGenerator
+    from linkml.generators.jsonschemagen import JsonSchemaGenerator
+    from linkml.generators.owlgen import OwlSchemaGenerator
+    from linkml.generators.prefixmapgen import PrefixGenerator
+    from linkml.generators.protogen import ProtoGenerator
+    from linkml.generators.pythongen import PythonGenerator
+    from linkml.generators.shaclgen import ShaclGenerator
+    from linkml.generators.shexgen import ShExGenerator
+    from linkml.generators.sqltablegen import SQLTableGenerator
+
+    return [
+        ("graphql",       GraphqlGenerator,    ".graphql",     {"mergeimports": True}),
+        ("jsonldcontext", ContextGenerator,    ".context.jsonld", {"mergeimports": True}),
+        ("jsonld",        JSONLDGenerator,     ".jsonld",      {"mergeimports": True}),
+        ("jsonschema",    JsonSchemaGenerator, ".schema.json", {"mergeimports": True}),
+        ("owl",           OwlSchemaGenerator,  ".owl.ttl",     {"mergeimports": True, "metaclasses": False, "type_objects": False}),
+        ("prefixmap",     PrefixGenerator,     ".yaml",        {"mergeimports": True}),
+        ("proto",         ProtoGenerator,      ".proto",       {"mergeimports": True}),
+        ("python",        PythonGenerator,     ".py",          {"mergeimports": True}),
+        ("shex",          ShExGenerator,       ".shex",        {"mergeimports": True}),
+        ("shacl",         ShaclGenerator,      ".shacl.ttl",   {"mergeimports": True}),
+        ("sqltable",      SQLTableGenerator,   ".sql",         {"mergeimports": True}),
+        # Excel uses a different API; skip unless --include-excel is passed
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Per-generator run with faulthandler watchdog
+# ---------------------------------------------------------------------------
+def _run_generator_child(
+    gen_name,
+    schema_str,
+    out_path,
+    stack_path,
+    timeout_s,
+    verbose,
+    conn,
+):
+    """Child process entrypoint: run one generator and report status to parent."""
+    start = time.monotonic()
+    try:
+        with open(stack_path, "w", encoding="utf-8") as sf:
+            sf.write(f"=== stack traces for {gen_name} ===\n")
+            sf.flush()
+
+            # Repeat dumps allow postmortem evidence if child hangs.
+            faulthandler.enable(file=sf)
+            faulthandler.dump_traceback_later(timeout_s, repeat=True, file=sf)
+
+            if hasattr(signal, "SIGUSR1"):
+                faulthandler.register(signal.SIGUSR1, file=sf, all_threads=True)
+
+            gen_map = _build_gen_map()
+            by_name = {name: (cls, args) for name, cls, _suffix, args in gen_map}
+            gen_cls, gen_args = by_name[gen_name]
+
+            if verbose:
+                print(f"[gen-each-child] starting {gen_name}", flush=True)
+
+            gen = gen_cls(schema_str, **gen_args)
+            result = gen.serialize()
+            Path(out_path).write_text(result, encoding="utf-8")
+
+            elapsed = time.monotonic() - start
+            conn.send(("ok", elapsed, ""))
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        conn.send(("error", elapsed, str(exc)))
+    finally:
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        conn.close()
+
+
+def run_generator(
+    gen_name,
+    gen_cls,
+    gen_args,
+    schema_path,
+    outdir,
+    timeout_s,
+    stack_log,
+    verbose,
+):
+    """Run one generator in a child process; enforce hard timeout."""
+    del gen_cls, gen_args  # resolved inside child to keep subprocess payload simple
+
+    schema_str = str(schema_path)
+    out_path = outdir / f"{gen_name}-output.tmp"
+    stack_path = Path(stack_log).parent / f"{gen_name}-stacks.log"
+
+    if verbose:
+        logging.info(f"[gen-each] Starting {gen_name} (timeout={timeout_s}s) ...")
+
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    proc = mp.Process(
+        target=_run_generator_child,
+        args=(
+            gen_name,
+            schema_str,
+            str(out_path),
+            str(stack_path),
+            timeout_s,
+            verbose,
+            child_conn,
+        ),
+        daemon=True,
+    )
+
+    start = time.monotonic()
+    proc.start()
+    child_conn.close()
+    proc.join(timeout=timeout_s)
+
+    if proc.is_alive():
+        # Force timeout behavior and collect stack trace evidence already written by child.
+        proc.terminate()
+        proc.join(timeout=5)
+        elapsed = time.monotonic() - start
+        logging.warning(
+            f"[gen-each] {gen_name} TIMED OUT after {elapsed:.1f}s; process terminated"
+            f"\n  Stack traces written to: {stack_path}"
+        )
+        return elapsed, "timeout", str(stack_path)
+
+    elapsed = time.monotonic() - start
+    status = "error"
+    error_msg = "No status received from child process"
+    if parent_conn.poll():
+        try:
+            status, child_elapsed, error_msg = parent_conn.recv()
+            # Prefer child's in-process timing when available.
+            elapsed = child_elapsed
+        except EOFError:
+            error_msg = (
+                f"Child exited with code {proc.exitcode} before sending a complete status message"
+            )
+    elif proc.exitcode not in (0, None):
+        error_msg = f"Child exited with code {proc.exitcode} before reporting status"
+
+    if status == "ok":
+        logging.info(f"[gen-each] {gen_name} OK in {elapsed:.1f}s")
+        return elapsed, "ok", ""
+
+    logging.error(f"[gen-each] {gen_name} FAILED after {elapsed:.1f}s: {error_msg}")
+    return elapsed, "error", str(stack_path)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run each gen-project generator individually with timing and stack-dump on hang."
+    )
+    parser.add_argument(
+        "--schema", required=True, type=Path, help="Path to schema YAML file"
+    )
+    parser.add_argument(
+        "--outdir",
+        type=Path,
+        default=None,
+        help="Directory for per-generator output files (default: /tmp/<schema_name>-gen-each)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Per-generator hard timeout in seconds (default: 120)",
+    )
+    parser.add_argument(
+        "--skip",
+        default="",
+        help="Comma-separated generator names to skip (e.g. 'graphql,jsonld,jsonschema,owl,prefixmap,proto')",
+    )
+    parser.add_argument(
+        "--only",
+        default="",
+        help="Comma-separated generator names to run exclusively (overrides --skip)",
+    )
+    parser.add_argument(
+        "--stack-log",
+        default="",
+        help="Directory prefix for per-generator stack log files (default: <outdir>/stacks)",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    schema_path = args.schema.resolve()
+    if not schema_path.exists():
+        logging.error(f"Schema not found: {schema_path}")
+        sys.exit(1)
+
+    schema_name = schema_path.stem
+    if args.outdir is None:
+        args.outdir = Path(f"/tmp/{schema_name}-gen-each")
+    if not args.stack_log:
+        args.stack_log = str(args.outdir / "stacks")
+
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    Path(args.stack_log).parent.mkdir(parents=True, exist_ok=True)
+
+    skip_set = {s.strip() for s in args.skip.split(",") if s.strip()}
+    only_set = {s.strip() for s in args.only.split(",") if s.strip()}
+
+    gen_map = _build_gen_map()
+
+    results = []
+    print(
+        f"\n{'Generator':<18} {'Status':<10} {'Elapsed':>9}  {'Notes'}"
+    )
+    print("-" * 70)
+
+    for gen_name, gen_cls, _suffix, default_args in gen_map:
+        if only_set and gen_name not in only_set:
+            print(f"{gen_name:<18} {'SKIP':<10} {'':>9}  (not in --only list)")
+            continue
+        if gen_name in skip_set:
+            print(f"{gen_name:<18} {'SKIP':<10} {'':>9}  (in --skip list)")
+            continue
+
+        elapsed, status, stack_path = run_generator(
+            gen_name=gen_name,
+            gen_cls=gen_cls,
+            gen_args=default_args,
+            schema_path=schema_path,
+            outdir=args.outdir,
+            timeout_s=args.timeout,
+            stack_log=args.stack_log,
+            verbose=args.verbose,
+        )
+
+        results.append((gen_name, status, elapsed, stack_path))
+        notes = f"stacks → {stack_path}" if stack_path else ""
+        print(f"{gen_name:<18} {status.upper():<10} {elapsed:>8.1f}s  {notes}")
+
+        # Stop at first timeout so the user isn't waiting for all timed-out generators
+        if status == "timeout":
+            print(
+                f"\n⚠  {gen_name} timed out — stopping here. "
+                f"Inspect stack traces:\n   {stack_path}"
+            )
+            break
+
+    # Summary
+    print("\n=== Summary ===")
+    for gen_name, status, elapsed, stack_path in results:
+        flag = "✓" if status == "ok" else ("✗ TIMEOUT" if status == "timeout" else "✗ ERROR")
+        print(f"  {flag:<12} {gen_name:<18} {elapsed:>8.1f}s")
+
+    timed_out = [r for r in results if r[1] == "timeout"]
+    errors = [r for r in results if r[1] == "error"]
+    if timed_out:
+        print(f"\nHanging generator(s): {', '.join(r[0] for r in timed_out)}")
+        print("Run with --verbose for more detail; check stack log files listed above.")
+        sys.exit(1)
+    if errors:
+        print(f"\nFailed generator(s): {', '.join(r[0] for r in errors)}")
+        print("Run with --verbose for more detail; check stack log files listed above.")
+        sys.exit(2)
+    else:
+        print("\nAll generators completed within timeout.")
+
+
+if __name__ == "__main__":
+    main()
