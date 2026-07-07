@@ -1,0 +1,42 @@
+# ============== LOKF knowledge-base recipes ==============
+#
+# These recipes drive the `lokf` toolkit (installed as a project dependency)
+# against the `knowledge/` bundle. See https://lokf.nolan-nichols.com
+
+bundle := "knowledge"
+
+# Regenerate LOKF artifacts and validate the knowledge bundle
+lokf-build:
+    uv run lokf-build
+
+# Project a concept file or the bundle to RDF (Turtle) on stdout
+lokf-convert FILE=bundle:
+    uv run lokf convert --format ttl {{ FILE }}
+
+# Run a SPARQL query over the bundle (schema prefixes are preset)
+lokf-query SPARQL BUNDLE=bundle:
+    uv run lokf query {{ BUNDLE }} {{ SPARQL }}
+
+# Serve the bundle locally: SPARQL endpoint + live graph explorer
+lokf-serve BUNDLE=bundle:
+    uv run lokf serve {{ BUNDLE }}
+
+# Project the bundle to linked tabular outputs (needs the `tables` extra)
+lokf-tables BUNDLE=bundle:
+    uv run lokf tables {{ BUNDLE }}
+
+# Write graph.json + datasets.jsonld for a static site
+lokf-export BUNDLE=bundle:
+    uv run lokf export {{ BUNDLE }}
+
+# Suggest typed relations from prose links (add --apply to write them back)
+lokf-propose BUNDLE=bundle:
+    uv run lokf propose {{ BUNDLE }}
+
+# Install the bundled LOKF AI skills into .claude/skills
+lokf-skills-install:
+    uv run lokf skills install .claude/skills
+
+# Run the LOKF MCP server (stdio) so an agent can drive the toolkit
+lokf-mcp:
+    uv run lokf-mcp

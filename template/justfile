@@ -285,6 +285,9 @@ _ensure_examples_output:  # Ensure a clean examples/output directory exists
 
 import "project.justfile"
 
+# Optional LOKF recipes (present only when the project was generated with add_lokf).
+import? "lokf.justfile"
+
 # ====== Override recipes from above with custom versions =======
 
 # Uncomment the following line to allow duplicate recipe names

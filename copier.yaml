@@ -104,6 +104,16 @@ gh_action_docs_preview:
   type: bool
   default: true
 
+add_lokf:
+  help: |
+    Add LOKF (Linked Open Knowledge Format) support?
+       Adds the `lokf` toolkit as a dependency, a starter knowledge/ bundle
+       (markdown concepts that are also an RDF graph) and `lokf-*` just recipes
+       for building, querying, serving and exporting the knowledge base.
+       Coexists with the LinkML schema and works as a ./linkml/ sidecar.
+  type: bool
+  default: false
+
 # === copier configuration options ===
 # https://copier.readthedocs.io/en/stable/configuring/#available-settings
 
@@ -132,6 +142,7 @@ _skip_if_exists:
   - src/{{project_slug}}/schema/*
   - tests/test_data.py
   - tests/data/*
+  - knowledge/*
 
 _message_after_copy: |
 

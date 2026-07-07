@@ -40,6 +40,13 @@ def no_docs_preview_project(tmp_path_factory):
     return generate_project(dest, {"gh_action_docs_preview": False})
 
 
+@pytest.fixture(scope="session")
+def lokf_project(tmp_path_factory):
+    """Project generated with add_lokf=True."""
+    dest = tmp_path_factory.mktemp("lokf")
+    return generate_project(dest, {"add_lokf": True})
+
+
 @pytest.fixture(scope="session", params=ALL_LICENSES)
 def license_project(request, tmp_path_factory):
     """Project generated for each license type. Returns (license_name, project_path)."""

@@ -22,12 +22,33 @@
       Python datamodel
 * [tests/](tests/) - Python tests
   * [data/](tests/data) - Example data
+{%- if add_lokf %}
+* [knowledge/](knowledge/) - LOKF knowledge base (markdown concepts that are
+  also an RDF graph)
+{%- endif %}
 
 ## Developer Tools
 
 There are several pre-defined command-recipes available.
 They are written for the command runner [just](https://github.com/casey/just/).
 To list all pre-defined commands, run `just` or `just --list`.
+{%- if add_lokf %}
+
+## LOKF knowledge base
+
+This project ships a [LOKF](https://lokf.nolan-nichols.com) knowledge base under
+[knowledge/](knowledge/): markdown concepts with YAML frontmatter that are also
+a queryable RDF graph. The `lokf` toolkit is available via `lokf-*` recipes:
+
+* `just lokf-build` — regenerate LOKF artifacts and validate the bundle
+* `just lokf-serve` — SPARQL endpoint + live graph explorer
+* `just lokf-convert` — project the bundle to RDF (Turtle)
+* `just lokf-query '<SPARQL>'` — query the bundle
+* `just lokf-tables` — project the bundle to linked tables
+* `just lokf-export` — write `graph.json` + `datasets.jsonld` for a static site
+
+Run `just --list` to see all LOKF recipes.
+{%- endif %}
 
 ## Credits
 

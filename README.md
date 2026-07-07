@@ -67,7 +67,7 @@ cd path/to/new/directory
 ```
 Then run copier as follows:
 ```shell
-copier copy --trust https://github.com/linkml/linkml-project-copier .
+copier copy --trust https://github.com/lmodel/linkml-project-copier .
 ```
 
 The `--trust` option is needed because the template uses the jinja_extension `jinja2_time`.
@@ -83,7 +83,7 @@ The default license for new projects is `Apache-2.0`.
 It is also possible to use non-default branches or specific tags via `--vcs-ref` which is useful when developing the template:
 
 ```shell
-copier copy --trust --vcs-ref branch-name gh:linkml/linkml-project-copier ./path/to/destination
+copier copy --trust --vcs-ref branch-name gh:lmodel/linkml-project-copier ./path/to/destination
 ```
 
 ### Step 2: Set up the LinkML project

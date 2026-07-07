@@ -16,6 +16,11 @@ dynamic = ["version"]
 
 dependencies = [
   "linkml-runtime >=1.9.4",
+{%- if add_lokf %}
+  # LOKF toolkit: knowledge-base authoring, RDF/SPARQL build pipeline and the
+  # tabular projection extra. Requires Python >=3.11.
+  "lokf[build,tables] >=0.2.0",
+{%- endif %}
 ]
 
 [dependency-groups]

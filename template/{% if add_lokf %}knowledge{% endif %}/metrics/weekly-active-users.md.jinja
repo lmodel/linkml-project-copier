@@ -1,0 +1,21 @@
+---
+type: Metric
+title: Weekly Active Users
+description: Distinct users with at least one qualifying event in a trailing 7-day window.
+unit: users
+formula: COUNT(DISTINCT user_id) over trailing 7 days WHERE event_name IN qualifying_events
+tags: [example, growth, engagement]
+measures:
+  - glossary/active-user
+dependsOn:
+  - glossary/active-user
+---
+
+# Definition
+
+**Weekly Active Users (WAU)** is the count of distinct `user_id`s that produced at
+least one [qualifying event](../glossary/active-user.md) during the trailing
+7-day window.
+
+An example metric — delete it and add your own. Typed relations such as
+`measures` and `dependsOn` become edges in the knowledge graph.
