@@ -17,6 +17,7 @@ The specification is linkml/linkml-project-copier#163.
 import argparse
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 from linkml_runtime.utils.schemaview import SchemaView
 from ruamel.yaml import YAML
@@ -74,7 +75,8 @@ def schema_targets(view: SchemaView, doc: CommentedMap) -> dict[str, tuple]:
     Classes, slots, enums and class attributes are reachable by name, by the
     URI they declare (``class_uri`` and the like) and by their native URI under
     the schema's default prefix. A permissible value is reachable as
-    ``<enum>#<value>``, the form that linkml's ``gen-sssom`` writes for it.
+    ``<enum>#<value>``, with the text as written or percent-encoded, which is
+    the form linkml's ``gen-sssom`` writes for a value such as ``not known``.
     Each target is the YAML mapping that holds the element together with the
     element's key, so that an element written with an empty body keeps it
     unless a mapping is added to it.
@@ -96,7 +98,8 @@ def schema_targets(view: SchemaView, doc: CommentedMap) -> dict[str, tuple]:
                 )
             values = (node or {}).get("permissible_values") or {}
             for value in values:
-                keys = {f"{key}#{value}" for key in keys_for(name)}
+                texts = {value, quote(str(value).strip(), safe="")}
+                keys = {f"{key}#{text}" for key in keys_for(name) for text in texts}
                 targets.update(dict.fromkeys(keys, (values, value)))
     return targets
 
